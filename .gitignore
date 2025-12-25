@@ -1,0 +1,29 @@
+# --- Python 后端忽略项 ---
+backend/__pycache__/
+backend/*.py[cod]
+backend/venv/
+backend/.env
+backend/.vscode/
+
+# 忽略大模型文件 (用户需要自己下载)
+backend/*.pth
+backend/*.pt
+backend/sam_vit_b_01ec64.pth
+
+# 忽略 PaddleOCR 下载的缓存和模型
+backend/paddle_cache/
+backend/paddle_home/
+backend/temp_uploads/
+backend/output_svgs/
+
+# --- Node.js 前端忽略项 ---
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/.DS_Store
+frontend/.env.local
+
+# --- 系统文件 ---
+.DS_Store
+Thumbs.db
