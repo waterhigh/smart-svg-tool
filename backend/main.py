@@ -1,35 +1,52 @@
-# backend/main.py
 import os
-import sys
+import shutil
+import uuid
+import logging
+import numpy as np
+import torch
+import vtracer
+from PIL import Image
+from datetime import timedelta
 
-# --- 1. 路径重定向 (保持不变) ---
+# FastAPI 相关
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.security import OAuth2PasswordRequestForm
+
+# 数据库与逻辑
+from sqlalchemy.orm import Session
+from app import models, database, schemas, crud, auth
+
+# AI 模型 (只保留 SAM)
+from segment_anything import sam_model_registry, SamPredictor
+# ❌ 已删除 PaddleOCR 引用
+
+# --- 1. 环境初始化 ---
+# 自动创建数据库表
+models.Base.metadata.create_all(bind=database.engine)
+
 project_root = os.path.dirname(os.path.abspath(__file__))
-fake_home_dir = os.path.join(project_root, "paddle_home")
+fake_home_dir = os.path.join(project_root, "paddle_home") # 这个目录其实没用了，但留着防止报错
 os.makedirs(fake_home_dir, exist_ok=True)
 os.environ['USERPROFILE'] = fake_home_dir
 os.environ['HOME'] = fake_home_dir
 os.environ['XDG_CACHE_HOME'] = fake_home_dir
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from PIL import Image
-import numpy as np
-import torch
-import shutil
-import vtracer
-import uuid
-import cv2
-import logging
-from segment_anything import sam_model_registry, SamPredictor
-from paddleocr import PaddleOCR
-
-logging.getLogger("ppocr").setLevel(logging.WARNING)
-
 app = FastAPI()
 
-# 允许跨域 (虽然合并后不需要跨域了，但留着无妨)
+# --- 2. 目录配置 ---
+TEMP_DIR = "temp_uploads"
+OUTPUT_DIR = "output_svgs"
+FRONTEND_DIST_DIR = os.path.join(os.path.dirname(project_root), "frontend", "out")
+
+os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+if not os.path.exists(FRONTEND_DIST_DIR):
+    os.makedirs(FRONTEND_DIST_DIR)
+
+# --- 3. 中间件配置 ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,21 +55,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 目录配置
-TEMP_DIR = "temp_uploads"
-OUTPUT_DIR = "output_svgs"
-# 🔥 指向前端打包后的文件夹 (假设 backend 和 frontend 是兄弟目录)
-FRONTEND_DIST_DIR = os.path.join(os.path.dirname(project_root), "frontend", "out")
-
-os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# 挂载资源目录
-app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
-app.mount("/uploads", StaticFiles(directory=TEMP_DIR), name="uploads")
-
-# --- AI 模型初始化 (保持不变) ---
-print("正在加载 AI 模型...")
+# --- 4. AI 模型加载 (仅 SAM) ---
+print("正在加载 SAM 模型...")
 CHECKPOINT_PATH = r"F:\smart_svg_tool\weights\sam_vit_b_01ec64.pth" 
 MODEL_TYPE = "vit_b"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -60,58 +64,61 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 sam_loaded = False
 if not os.path.exists(CHECKPOINT_PATH):
     print(f"❌ 错误：找不到 SAM 模型文件 {CHECKPOINT_PATH}")
+    predictor = None
 else:
     try:
         sam = sam_model_registry[MODEL_TYPE](checkpoint=CHECKPOINT_PATH)
         sam.to(device=DEVICE)
         predictor = SamPredictor(sam)
         sam_loaded = True
-        print(f"✅ SAM 模型加载完成！")
+        print(f"✅ SAM 模型加载完成！(OCR 模块已禁用)")
     except Exception as e:
         print(f"❌ SAM 加载失败: {e}")
+        predictor = None
 
-# OCR 初始化 (保持不变)
-try:
-    ocr_engine = PaddleOCR(use_textline_orientation=True, lang="ch")
-except:
-    try:
-        ocr_engine = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
-    except:
-        ocr_engine = None
-print(f"✅ OCR 引擎状态: {'可用' if ocr_engine else '不可用'}")
+# ❌ 已删除 OCR 初始化代码，节省大量内存！
 
 current_image_path = None
 
-# --- 辅助函数 (保持不变) ---
+# --- 5. 辅助函数 (修改版) ---
 def inpaint_text(img_path, output_path):
-    if not ocr_engine:
-        shutil.copyfile(img_path, output_path)
-        return
-    try:
-        img = cv2.imread(img_path)
-        result = ocr_engine.ocr(img_path, cls=True)
-        if not result or (isinstance(result, list) and len(result)>0 and result[0] is None):
-            shutil.copyfile(img_path, output_path)
-            return
-        
-        mask = np.zeros(img.shape[:2], dtype=np.uint8)
-        lines = result[0] if result and isinstance(result[0], list) else result
-        if lines:
-            for line in lines:
-                try:
-                    box = np.array(line[0]).astype(np.int32).reshape((-1, 1, 2))
-                    cv2.fillPoly(mask, [box], 255)
-                except: continue
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.dilate(mask, kernel, iterations=2)
-        cleaned_img = cv2.inpaint(img, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-        cv2.imwrite(output_path, cleaned_img)
-    except:
-        shutil.copyfile(img_path, output_path)
+    """
+    修改版：不再进行 OCR 去字，直接复制文件。
+    这样既节省了资源，又保证了后续代码逻辑（需要一个 output_path 文件）不中断。
+    """
+    shutil.copyfile(img_path, output_path)
 
-# --- API 路由 (保持不变) ---
+# =========================================================
+# 🔥 核心 API 路由
+# =========================================================
+
+# 1. 注册接口
+@app.post("/users/", response_model=schemas.User)
+def create_user(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
+    db_user = crud.get_user_by_email(db, email=user.email)
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    return crud.create_user(db=db, user=user)
+
+# 2. 登录接口
+@app.post("/token", response_model=dict)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
+    user = crud.get_user_by_email(db, email=form_data.username)
+    if not user or not crud.verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=auth.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = auth.create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# 3. 上传接口
 @app.post("/upload/")
-async def upload_image(file: UploadFile = File(...)):
+async def upload_image(file: UploadFile = File(...), current_user: schemas.User = Depends(auth.get_current_user)):
     global current_image_path
     filename = f"{uuid.uuid4()}_{file.filename}"
     original_path = f"{TEMP_DIR}/original_{filename}"
@@ -120,23 +127,31 @@ async def upload_image(file: UploadFile = File(...)):
     with open(original_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
+    # 这里现在只是简单的复制文件，速度极快
     inpaint_text(original_path, cleaned_path)
     current_image_path = cleaned_path
     
     image_pil = Image.open(cleaned_path).convert("RGB")
-    predictor.set_image(np.array(image_pil))
+    if predictor:
+        predictor.set_image(np.array(image_pil))
     
     return JSONResponse({
         "message": "OK",
-        "image_url": f"/uploads/{os.path.basename(cleaned_path)}", # 改为相对路径
+        "image_url": f"/uploads/{os.path.basename(cleaned_path)}",
         "image_width": image_pil.width,
         "image_height": image_pil.height
     })
 
+# 4. 拆解接口
 @app.post("/segment/")
-async def segment_point(x: float = Form(...), y: float = Form(...)):
+async def segment_point(
+    x: float = Form(...), 
+    y: float = Form(...),
+    current_user: schemas.User = Depends(auth.get_current_user)
+):
     global current_image_path
     if not current_image_path: raise HTTPException(status_code=400, detail="No image")
+    if not predictor: raise HTTPException(status_code=500, detail="AI Model not loaded")
 
     input_point = np.array([[int(x), int(y)]])
     masks, scores, _ = predictor.predict(point_coords=input_point, point_labels=np.array([1]), multimask_output=True)
@@ -167,28 +182,17 @@ async def segment_point(x: float = Form(...), y: float = Form(...)):
     )
     
     return JSONResponse({
-        "svg_url": f"/outputs/p_{pid}.svg", # 改为相对路径
+        "svg_url": f"/outputs/p_{pid}.svg",
         "offset_x": bbox[0], "offset_y": bbox[1]
     })
 
-# --- 🔥 托管前端静态文件 (必须放在所有 API 路由之后) ---
-# 1. 托管 _next 静态资源
-app.mount("/_next", StaticFiles(directory=os.path.join(FRONTEND_DIST_DIR, "_next")), name="next")
+# =========================================================
+# 📂 静态文件托管
+# =========================================================
 
-# 2. 托管主页和其他静态文件
-@app.get("/{full_path:path}")
-async def serve_frontend(full_path: str):
-    # 如果请求的是 API，跳过 (虽然上面已经匹配了，但为了保险)
-    if full_path.startswith("upload/") or full_path.startswith("segment/"):
-        return HTTPException(status_code=404)
-        
-    # 尝试在 out 目录下找文件
-    file_path = os.path.join(FRONTEND_DIST_DIR, full_path)
-    if os.path.exists(file_path) and os.path.isfile(file_path):
-        return FileResponse(file_path)
-    
-    # 默认返回 index.html (SPA 单页应用支持)
-    return FileResponse(os.path.join(FRONTEND_DIST_DIR, "index.html"))
+app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
+app.mount("/uploads", StaticFiles(directory=TEMP_DIR), name="uploads")
+app.mount("/", StaticFiles(directory=FRONTEND_DIST_DIR, html=True), name="frontend")
 
 if __name__ == "__main__":
     import uvicorn
