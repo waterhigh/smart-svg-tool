@@ -1,199 +1,264 @@
-import os
-import shutil
-import uuid
-import logging
-import numpy as np
-import torch
-import vtracer
-from PIL import Image
-from datetime import timedelta
+from __future__ import annotations
 
-# FastAPI 相关
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Depends, status
+import json
+import logging
+from contextlib import asynccontextmanager
+from datetime import timedelta
+from typing import Any
+
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordRequestForm
-
-# 数据库与逻辑
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from app import models, database, schemas, crud, auth
 
-# AI 模型 (只保留 SAM)
-from segment_anything import sam_model_registry, SamPredictor
-# ❌ 已删除 PaddleOCR 引用
+from app import auth, crud, database, models, schemas
+from app.config import settings
+from app.segmentation import PRESETS, SegmentationService
+from app.task_store import TaskStore
 
-# --- 1. 环境初始化 ---
-# 自动创建数据库表
-models.Base.metadata.create_all(bind=database.engine)
 
-project_root = os.path.dirname(os.path.abspath(__file__))
-fake_home_dir = os.path.join(project_root, "paddle_home") # 这个目录其实没用了，但留着防止报错
-os.makedirs(fake_home_dir, exist_ok=True)
-os.environ['USERPROFILE'] = fake_home_dir
-os.environ['HOME'] = fake_home_dir
-os.environ['XDG_CACHE_HOME'] = fake_home_dir
+logging.basicConfig(
+    level=getattr(logging, settings.log_level, logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("smart_svg.api")
 
-app = FastAPI()
+task_store = TaskStore(
+    root_dir=settings.runtime_dir,
+    ttl_hours=settings.task_ttl_hours,
+    max_upload_mb=settings.max_upload_mb,
+    max_image_side=settings.max_image_side,
+)
+segmentation_service = SegmentationService(task_store)
 
-# --- 2. 目录配置 ---
-TEMP_DIR = "temp_uploads"
-OUTPUT_DIR = "output_svgs"
-FRONTEND_DIST_DIR = os.path.join(os.path.dirname(project_root), "frontend", "out")
 
-os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-if not os.path.exists(FRONTEND_DIST_DIR):
-    os.makedirs(FRONTEND_DIST_DIR)
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    models.Base.metadata.create_all(bind=database.engine)
+    task_store.cleanup_expired()
+    segmentation_service.load()
+    yield
 
-# --- 3. 中间件配置 ---
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=settings.cors_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 4. AI 模型加载 (仅 SAM) ---
-print("正在加载 SAM 模型...")
-CHECKPOINT_PATH = r"F:\smart_svg_tool\weights\sam_vit_b_01ec64.pth" 
-MODEL_TYPE = "vit_b"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-sam_loaded = False
-if not os.path.exists(CHECKPOINT_PATH):
-    print(f"❌ 错误：找不到 SAM 模型文件 {CHECKPOINT_PATH}")
-    predictor = None
-else:
+def _parse_bool(raw_value: str | None, default: bool | None = None) -> bool | None:
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _parse_points(raw_value: str) -> list[dict[str, Any]]:
     try:
-        sam = sam_model_registry[MODEL_TYPE](checkpoint=CHECKPOINT_PATH)
-        sam.to(device=DEVICE)
-        predictor = SamPredictor(sam)
-        sam_loaded = True
-        print(f"✅ SAM 模型加载完成！(OCR 模块已禁用)")
-    except Exception as e:
-        print(f"❌ SAM 加载失败: {e}")
-        predictor = None
+        payload = json.loads(raw_value or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid point payload.") from exc
 
-# ❌ 已删除 OCR 初始化代码，节省大量内存！
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=400, detail="Point payload must be a list.")
 
-current_image_path = None
+    points: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="Each point must be an object.")
+        if "x" not in item or "y" not in item or "label" not in item:
+            raise HTTPException(status_code=400, detail="Each point needs x, y, label.")
+        points.append(
+            {
+                "x": float(item["x"]),
+                "y": float(item["y"]),
+                "label": int(item["label"]),
+            }
+        )
+    return points
 
-# --- 5. 辅助函数 (修改版) ---
-def inpaint_text(img_path, output_path):
-    """
-    修改版：不再进行 OCR 去字，直接复制文件。
-    这样既节省了资源，又保证了后续代码逻辑（需要一个 output_path 文件）不中断。
-    """
-    shutil.copyfile(img_path, output_path)
 
-# =========================================================
-# 🔥 核心 API 路由
-# =========================================================
+def _parse_box(raw_value: str | None) -> dict[str, float] | None:
+    if not raw_value:
+        return None
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid box payload.") from exc
 
-# 1. 注册接口
+    required_keys = {"x0", "y0", "x1", "y1"}
+    if not isinstance(payload, dict) or not required_keys.issubset(payload):
+        raise HTTPException(status_code=400, detail="Box payload is incomplete.")
+
+    x0, x1 = sorted([float(payload["x0"]), float(payload["x1"])])
+    y0, y1 = sorted([float(payload["y0"]), float(payload["y1"])])
+    if abs(x1 - x0) < 2 or abs(y1 - y0) < 2:
+        raise HTTPException(status_code=400, detail="The box is too small.")
+    return {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
+
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "model_ready": segmentation_service.ready,
+        "model_error": segmentation_service.last_error,
+        "device": segmentation_service.device,
+        "presets": list(PRESETS.keys()),
+    }
+
+
+@app.get("/me", response_model=schemas.User | None)
+async def read_current_user(
+    current_user: schemas.User | None = Depends(auth.get_current_user_optional),
+):
+    return current_user
+
+
 @app.post("/users/", response_model=schemas.User)
 def create_user(user: schemas.UserCreate, db: Session = Depends(database.get_db)):
     db_user = crud.get_user_by_email(db, email=user.email)
     if db_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=400, detail="Email already registered.")
     return crud.create_user(db=db, user=user)
 
-# 2. 登录接口
-@app.post("/token", response_model=dict)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
+
+@app.post("/token", response_model=schemas.Token)
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(database.get_db),
+):
     user = crud.get_user_by_email(db, email=form_data.username)
     if not user or not crud.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
+            detail="Incorrect email or password.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    access_token_expires = timedelta(minutes=auth.ACCESS_TOKEN_EXPIRE_MINUTES)
+
     access_token = auth.create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
+        data={"sub": user.email},
+        expires_delta=timedelta(minutes=settings.access_token_expire_minutes),
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# 3. 上传接口
+
 @app.post("/upload/")
-async def upload_image(file: UploadFile = File(...), current_user: schemas.User = Depends(auth.get_current_user)):
-    global current_image_path
-    filename = f"{uuid.uuid4()}_{file.filename}"
-    original_path = f"{TEMP_DIR}/original_{filename}"
-    cleaned_path = f"{TEMP_DIR}/cleaned_{filename}"
-    
-    with open(original_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    # 这里现在只是简单的复制文件，速度极快
-    inpaint_text(original_path, cleaned_path)
-    current_image_path = cleaned_path
-    
-    image_pil = Image.open(cleaned_path).convert("RGB")
-    if predictor:
-        predictor.set_image(np.array(image_pil))
-    
-    return JSONResponse({
-        "message": "OK",
-        "image_url": f"/uploads/{os.path.basename(cleaned_path)}",
-        "image_width": image_pil.width,
-        "image_height": image_pil.height
-    })
-
-# 4. 拆解接口
-@app.post("/segment/")
-async def segment_point(
-    x: float = Form(...), 
-    y: float = Form(...),
-    current_user: schemas.User = Depends(auth.get_current_user)
+async def upload_image(
+    file: UploadFile = File(...),
+    current_user: schemas.User | None = Depends(auth.get_current_user_optional),
 ):
-    global current_image_path
-    if not current_image_path: raise HTTPException(status_code=400, detail="No image")
-    if not predictor: raise HTTPException(status_code=500, detail="AI Model not loaded")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload a valid image file.")
 
-    input_point = np.array([[int(x), int(y)]])
-    masks, scores, _ = predictor.predict(point_coords=input_point, point_labels=np.array([1]), multimask_output=True)
-    best_mask = masks[np.argmax(scores)]
-    
-    mask_img = Image.fromarray((best_mask * 255).astype(np.uint8)).convert("L")
-    orig = Image.open(current_image_path).convert("RGBA")
-    res = Image.new("RGBA", orig.size, (0,0,0,0))
-    res.paste(orig, (0,0), mask_img)
-    
-    bbox = res.getbbox()
-    if not bbox: raise HTTPException(400, "Empty")
-    
-    pad=2
-    bbox = (max(0, bbox[0]-pad), max(0, bbox[1]-pad), min(orig.width, bbox[2]+pad), min(orig.height, bbox[3]+pad))
-    res = res.crop(bbox)
-    
-    pid = str(uuid.uuid4())
-    png_p = f"{TEMP_DIR}/p_{pid}.png"
-    svg_p = f"{OUTPUT_DIR}/p_{pid}.svg"
-    res.save(png_p)
-    
-    vtracer.convert_image_to_svg_py(
-        png_p, svg_p, colormode='color', hierarchical='stacked', mode='spline',
-        filter_speckle=4, color_precision=7, layer_difference=12,
-        corner_threshold=45, length_threshold=10, max_iterations=10,
-        splice_threshold=45, path_precision=4
+    try:
+        task = task_store.create_task(file)
+        logger.info(
+            "Upload created",
+            extra={
+                "upload_id": task.upload_id,
+                "owner": getattr(current_user, "email", None),
+                "width": task.width,
+                "height": task.height,
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return JSONResponse(
+        {
+            "message": "ok",
+            "upload_id": task.upload_id,
+            "image_url": task_store.to_media_url(task.working_file),
+            "image_width": task.width,
+            "image_height": task.height,
+            "expires_at": task.expires_at,
+        }
     )
-    
-    return JSONResponse({
-        "svg_url": f"/outputs/p_{pid}.svg",
-        "offset_x": bbox[0], "offset_y": bbox[1]
-    })
 
-# =========================================================
-# 📂 静态文件托管
-# =========================================================
 
-app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
-app.mount("/uploads", StaticFiles(directory=TEMP_DIR), name="uploads")
-app.mount("/", StaticFiles(directory=FRONTEND_DIST_DIR, html=True), name="frontend")
+@app.post("/segment/")
+async def segment_image(
+    upload_id: str = Form(...),
+    points_json: str = Form("[]"),
+    box_json: str = Form(""),
+    preset: str = Form("photo"),
+    vector_mode: str = Form("color"),
+    detail: int = Form(2),
+    smoothing: int = Form(2),
+    keep_holes: str = Form("true"),
+    largest_component: str | None = Form(None),
+):
+    points = _parse_points(points_json)
+    box = _parse_box(box_json)
+    if not points and not box:
+        raise HTTPException(
+            status_code=400,
+            detail="Add at least one point or one box before extracting.",
+        )
+
+    try:
+        task = task_store.get_task(upload_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    try:
+        candidates = segmentation_service.segment(
+            task=task,
+            points=points,
+            box=box,
+            preset_name=preset,
+            vector_mode=vector_mode,
+            detail=detail,
+            smoothing=smoothing,
+            keep_holes=bool(_parse_bool(keep_holes, True)),
+            largest_component=_parse_bool(largest_component, None),
+        )
+        logger.info(
+            "Segmentation completed",
+            extra={
+                "upload_id": upload_id,
+                "preset": preset,
+                "vector_mode": vector_mode,
+                "candidates": len(candidates),
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return JSONResponse(
+        {
+            "upload_id": upload_id,
+            "preset": preset,
+            "vector_mode": vector_mode,
+            "candidates": candidates,
+        }
+    )
+
+
+app.mount("/media", StaticFiles(directory=settings.runtime_dir), name="media")
+
+if settings.serve_frontend and settings.frontend_dist_dir.exists():
+    app.mount(
+        "/",
+        StaticFiles(directory=settings.frontend_dist_dir, html=True),
+        name="frontend",
+    )
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

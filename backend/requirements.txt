@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+sqlalchemy
+passlib
+bcrypt==3.2.2
+python-jose
+python-dotenv
+numpy
+pillow
+opencv-python-headless
+segment-anything
+torch
+torchvision
+vtracer

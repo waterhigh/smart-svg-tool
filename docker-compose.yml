@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///./runtime/smart_svg.db}
+      RUNTIME_DIR: ${RUNTIME_DIR:-./runtime}
+      SAM_CHECKPOINT_PATH: ${SAM_CHECKPOINT_PATH:-./weights/sam_vit_b_01ec64.pth}
+      SERVE_FRONTEND: "false"
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/runtime:/app/runtime
+      - ./backend/weights:/app/weights:ro
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
