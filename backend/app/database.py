@@ -1,15 +1,19 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# 格式: postgresql://用户名:密码@地址:端口/数据库名
-SQLALCHEMY_DATABASE_URL = "postgresql://postgres:277979798@localhost:5432/smart_svg_db"
+from .config import settings
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+
+engine_kwargs: dict[str, object] = {"pool_pre_ping": True}
+if settings.database_url.startswith("sqlite"):
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(settings.database_url, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
-# 依赖项：用于在每个 API 请求中获取数据库会话
+
 def get_db():
     db = SessionLocal()
     try:

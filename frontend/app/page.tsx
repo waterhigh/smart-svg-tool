@@ -1,165 +1,270 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
-import dynamic from 'next/dynamic';
-import { Layout, Upload, message, Card, Steps, Spin } from 'antd';
-import { InboxOutlined, CloudUploadOutlined, ScissorOutlined, SelectOutlined } from '@ant-design/icons';
-import type { UploadProps } from 'antd';
-import { useRouter } from 'next/navigation';
+import { message } from 'antd';
+import Link from 'next/link';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import SvgEditor from './SvgEditor';
+import { apiUrl } from './lib/api';
 
-// 动态引入编辑器组件
-const SvgEditor = dynamic(() => import('./SvgEditor'), { 
-  ssr: false,
-  loading: () => (
-    <div className="h-96 flex flex-col items-center justify-center gap-2">
-      <Spin size="large" />
-      <span className="text-gray-500">正在加载编辑器...</span>
-    </div>
-  )
-});
+type WorkspaceImage = {
+  uploadId: string;
+  imageUrl: string;
+  imageWidth: number;
+  imageHeight: number;
+  expiresAt: string;
+};
 
-const { Header, Content, Footer } = Layout;
-const { Dragger } = Upload;
+type CurrentUser = {
+  email: string;
+} | null;
+
+const ACCEPTED_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
 
 export default function Home() {
-  const [imageUrl, setImageUrl] = useState<string | null>(null);
-  const [imgDims, setImgDims] = useState({ w: 0, h: 0 });
-  const [currentStep, setCurrentStep] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [workspaceImage, setWorkspaceImage] = useState<WorkspaceImage | null>(null);
   const [isUploading, setIsUploading] = useState(false);
-  
-  // 🔐 认证状态管理
-  const [token, setToken] = useState<string>('');
-  const [isAuthChecking, setIsAuthChecking] = useState(true); // 👈 默认正在检查
-  const router = useRouter();
+  const [isDragging, setIsDragging] = useState(false);
+  const [currentUser, setCurrentUser] = useState<CurrentUser>(null);
 
-  // 🛡️ 核心修复：权限检查逻辑
   useEffect(() => {
-    // 确保只在客户端执行
-    if (typeof window !== 'undefined') {
-        const storedToken = localStorage.getItem('smart_svg_token');
-        
-        if (!storedToken) {
-            // ❌ 如果没 Token：
-            // 1. 不设置 isAuthChecking = false (保持 Loading 状态)
-            // 2. 提示并立即跳转 (用 replace 防止回退循环)
-            message.warning({ content: '请先登录', key: 'auth_check' }); // key避免重复弹窗
-            window.location.href = '/login';
-        } else {
-            // ✅ 如果有 Token：
-            setToken(storedToken);
-            setIsAuthChecking(false); // 解除 Loading，显示主页
-        }
+    const token = window.localStorage.getItem('smart_svg_token');
+    if (!token) {
+      return;
     }
-  }, [router]);
 
-  const props: UploadProps = {
-    name: 'file',
-    multiple: false,
-    action: '/upload/',
-    headers: {
-        Authorization: `Bearer ${token}`
-    },
-    onChange(info) {
-      const { status, response, error } = info.file;
-      
-      if (status === 'uploading') {
-        setCurrentStep(1);
-        setIsUploading(true);
-      }
-      
-      if (status === 'done') {
-        setIsUploading(false);
-        message.success(`图片加载完成，AI 引擎已就绪！`);
-        if (response) {
-            setImageUrl(response.image_url);
-            setImgDims({ w: response.image_width, h: response.image_height });
-            setCurrentStep(2);
+    fetch(apiUrl('/me'), {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error('expired');
         }
-      } else if (status === 'error') {
-        setIsUploading(false);
-        // 如果是 401，说明 Token 过期
-        if (error?.status === 401) {
-            message.error('登录已过期，请重新登录');
-            localStorage.removeItem('smart_svg_token'); // 清除无效 Token
-            router.replace('/login');
-        } else {
-            message.error(`${info.file.name} 上传失败。`);
-        }
-        setCurrentStep(0);
+        const user = await response.json();
+        setCurrentUser(user);
+      })
+      .catch(() => {
+        window.localStorage.removeItem('smart_svg_token');
+        setCurrentUser(null);
+      });
+  }, []);
+
+  const featurePills = useMemo(
+    () => ['Task-isolated uploads', 'Positive / negative prompts', 'Box-guided masks', 'Contour + color vector modes'],
+    [],
+  );
+
+  const uploadFile = async (file: File) => {
+    if (!ACCEPTED_TYPES.includes(file.type)) {
+      message.error('仅支持 PNG / JPG / WEBP 图片。');
+      return;
+    }
+
+    setIsUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const token = window.localStorage.getItem('smart_svg_token');
+      const response = await fetch(apiUrl('/upload/'), {
+        method: 'POST',
+        body: formData,
+        headers: token
+          ? {
+              Authorization: `Bearer ${token}`,
+            }
+          : undefined,
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.detail || '上传失败。');
       }
-    },
-    showUploadList: false,
+
+      setWorkspaceImage({
+        uploadId: payload.upload_id,
+        imageUrl: payload.image_url,
+        imageWidth: payload.image_width,
+        imageHeight: payload.image_height,
+        expiresAt: payload.expires_at,
+      });
+      message.success('图片已进入工作台，可以开始精修分割。');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : '上传失败。';
+      message.error(errorMessage);
+    } finally {
+      setIsUploading(false);
+    }
   };
 
-  // ⏳ 如果正在检查权限，只显示全屏 Loading
-  // 这能彻底防止"主页闪烁"和"重复弹窗"
-  if (isAuthChecking) {
-      return (
-          <div className="min-h-screen flex items-center justify-center bg-gray-50">
-              <Spin size="large" tip="正在验证身份..." />
-          </div>
-      );
-  }
+  const openPicker = () => {
+    inputRef.current?.click();
+  };
 
-  // 🚀 只有通过检查，才会渲染下面的真实页面
   return (
-    <Layout className="min-h-screen bg-gray-50">
-      <Header className="bg-white border-b border-gray-200 flex items-center justify-between px-8">
-        <div className="flex items-center gap-2">
-           <ScissorOutlined className="text-2xl text-blue-600"/>
-           <span className="text-xl font-bold text-white">智能 PNG 拆解 (SAM版)</span>
+    <div className="app-shell">
+      <header className="mx-auto flex max-w-7xl items-center justify-between px-5 py-5 sm:px-8">
+        <div className="flex items-center gap-3">
+          <div className="display-face rounded-full border border-[rgba(24,21,17,0.14)] bg-[rgba(255,250,241,0.8)] px-3 py-2 text-xs font-extrabold uppercase tracking-[0.22em] text-[var(--accent)]">
+            Smart SVG
+          </div>
+          <div>
+            <p className="display-face text-lg font-bold text-[var(--text)]">Precision Cutout Workspace</p>
+            <p className="text-sm text-[var(--muted)]">先试用，再登录；上传任务彼此隔离。</p>
+          </div>
         </div>
-        
-        {/* 退出按钮 */}
-        <div 
-            className="text-gray-500 cursor-pointer hover:text-red-500 transition-colors"
-            onClick={() => {
-                localStorage.removeItem('smart_svg_token');
-                message.success('已退出登录');
-                router.replace('/login');
-            }}
-        >
-            退出登录
+
+        <div className="flex items-center gap-3">
+          {currentUser ? (
+            <>
+              <div className="hidden rounded-full border border-[rgba(24,21,17,0.1)] bg-[rgba(255,250,244,0.72)] px-4 py-2 text-sm font-semibold text-[var(--muted)] sm:block">
+                {currentUser.email}
+              </div>
+              <button
+                className="ink-button ink-button-muted"
+                onClick={() => {
+                  window.localStorage.removeItem('smart_svg_token');
+                  setCurrentUser(null);
+                  message.success('已退出登录。');
+                }}
+                type="button"
+              >
+                退出
+              </button>
+            </>
+          ) : (
+            <>
+              <Link className="ink-button ink-button-muted" href="/login">
+                登录
+              </Link>
+              <Link className="ink-button ink-button-primary" href="/register">
+                注册
+              </Link>
+            </>
+          )}
         </div>
-      </Header>
+      </header>
 
-      <Content className="p-8 max-w-[1400px] mx-auto w-full">
-        <Steps 
-          current={currentStep}
-          className="mb-8"
-          items={[
-            { title: '上传图片', icon: <CloudUploadOutlined /> },
-            { title: 'AI 预处理', icon: <ScissorOutlined /> },
-            { title: '点击拆解', icon: <SelectOutlined /> },
-          ]}
-        />
+      <main className="mx-auto max-w-7xl px-5 pb-12 sm:px-8">
+        {!workspaceImage ? (
+          <section className="grid gap-8 lg:grid-cols-[1.15fr_0.85fr]">
+            <div className="glass-panel-strong overflow-hidden rounded-[32px] p-8 sm:p-10">
+              <div className="mb-8 flex flex-wrap gap-2">
+                {featurePills.map((pill) => (
+                  <span className="ink-pill" key={pill}>
+                    {pill}
+                  </span>
+                ))}
+              </div>
 
-        {!imageUrl ? (
-            <Card title="上传原始图片" className="shadow-md rounded-xl h-96">
-                <Spin spinning={isUploading} tip="正在上传并计算 Embeddings (大图可能需要十几秒)...">
-                    <Dragger {...props} className="h-full" disabled={isUploading}>
-                        <p className="ant-upload-drag-icon">
-                        <InboxOutlined className="text-blue-500 text-6xl" />
-                        </p>
-                        <p className="ant-upload-text text-xl">点击或拖拽 PNG/JPG 图片到这里</p>
-                        <p className="ant-upload-hint">
-                            首次运行后端需要加载 SAM 模型，可能需要等待 30 秒左右。
-                        </p>
-                    </Dragger>
-                </Spin>
-            </Card>
+              <p className="mb-4 display-face text-5xl font-extrabold leading-[0.95] tracking-[-0.04em] text-[var(--text)] sm:text-7xl">
+                切得更准，
+                <br />
+                画得更净。
+              </p>
+              <p className="max-w-2xl text-lg leading-8 text-[var(--muted)]">
+                新版工作流把图片拆成任务级隔离，支持正负点击、框选约束、候选结果筛选，以及轮廓模式 / 彩色矢量模式双路线。
+              </p>
+
+              <div className="mt-10 grid gap-4 sm:grid-cols-3">
+                <div className="rounded-[26px] border border-[rgba(24,21,17,0.1)] bg-[rgba(255,252,247,0.9)] p-5">
+                  <p className="display-face text-xl font-bold">1</p>
+                  <p className="mt-3 text-sm font-semibold text-[var(--text)]">上传后生成 `upload_id`</p>
+                  <p className="mt-2 text-sm leading-6 text-[var(--muted)]">同一服务内不会再串图，多次点击和多人使用都按任务隔离。</p>
+                </div>
+                <div className="rounded-[26px] border border-[rgba(24,21,17,0.1)] bg-[rgba(255,252,247,0.9)] p-5">
+                  <p className="display-face text-xl font-bold">2</p>
+                  <p className="mt-3 text-sm font-semibold text-[var(--text)]">候选 mask + 后处理</p>
+                  <p className="mt-2 text-sm leading-6 text-[var(--muted)]">保守、完整、平衡三个候选结果，统一走去噪、补洞、平滑处理。</p>
+                </div>
+                <div className="rounded-[26px] border border-[rgba(24,21,17,0.1)] bg-[rgba(255,252,247,0.9)] p-5">
+                  <p className="display-face text-xl font-bold">3</p>
+                  <p className="mt-3 text-sm font-semibold text-[var(--text)]">SVG 双路线</p>
+                  <p className="mt-2 text-sm leading-6 text-[var(--muted)]">Logo 用 contour 更干净，插画和复杂主体走 color vector 保留色块。</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="glass-panel rounded-[32px] p-6 sm:p-8">
+              <div
+                className={`relative rounded-[30px] border border-dashed p-8 text-center transition-colors ${
+                  isDragging ? 'border-[rgba(228,87,46,0.55)] bg-[rgba(228,87,46,0.08)]' : 'border-[rgba(24,21,17,0.18)] bg-[rgba(255,252,247,0.78)]'
+                }`}
+                onDragEnter={(event) => {
+                  event.preventDefault();
+                  setIsDragging(true);
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  setIsDragging(true);
+                }}
+                onDragLeave={(event) => {
+                  event.preventDefault();
+                  setIsDragging(false);
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setIsDragging(false);
+                  const file = event.dataTransfer.files[0];
+                  if (file) {
+                    void uploadFile(file);
+                  }
+                }}
+              >
+                <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-full bg-[rgba(228,87,46,0.12)] text-3xl text-[var(--accent)]">
+                  ✦
+                </div>
+                <p className="display-face text-3xl font-bold text-[var(--text)]">立即试用</p>
+                <p className="mx-auto mt-4 max-w-sm text-sm leading-7 text-[var(--muted)]">
+                  支持拖拽上传，也可以点按钮选择文件。首次体验不要求登录，登录只用于保留账号入口。
+                </p>
+
+                <button
+                  className="ink-button ink-button-primary mt-8 w-full"
+                  disabled={isUploading}
+                  onClick={openPicker}
+                  type="button"
+                >
+                  {isUploading ? '上传中...' : '选择图片并进入工作台'}
+                </button>
+                <input
+                  accept=".png,.jpg,.jpeg,.webp"
+                  className="hidden"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) {
+                      void uploadFile(file);
+                    }
+                    event.currentTarget.value = '';
+                  }}
+                  ref={inputRef}
+                  type="file"
+                />
+
+                <div className="mt-8 rounded-[24px] border border-[rgba(24,21,17,0.08)] bg-[rgba(255,247,239,0.9)] p-5 text-left">
+                  <p className="text-sm font-bold uppercase tracking-[0.18em] text-[var(--accent-cool)]">推荐输入</p>
+                  <ul className="mt-4 space-y-3 text-sm leading-6 text-[var(--muted)]">
+                    <li>Logo / 图标：优先走 contour mode，边更硬、更省节点。</li>
+                    <li>插画 / 贴纸：建议 illustration 预设，兼顾闭合与色块保留。</li>
+                    <li>照片主体：用 photo 预设，再补负点击去掉背景粘连。</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          </section>
         ) : (
-            <SvgEditor 
-                imageUrl={imageUrl} 
-                imageWidth={imgDims.w} 
-                imageHeight={imgDims.h} 
-            />
+          <SvgEditor
+            expiresAt={workspaceImage.expiresAt}
+            imageHeight={workspaceImage.imageHeight}
+            imageUrl={workspaceImage.imageUrl}
+            imageWidth={workspaceImage.imageWidth}
+            onReset={() => setWorkspaceImage(null)}
+            uploadId={workspaceImage.uploadId}
+          />
         )}
-      </Content>
-      
-      <Footer className="text-center text-gray-400">
-        ©2025 Smart SVG Tool - Powered by SAM & VTracer
-      </Footer>
-    </Layout>
+      </main>
+    </div>
   );
 }

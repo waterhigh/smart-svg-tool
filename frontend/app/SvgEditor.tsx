@@ -1,352 +1,674 @@
-// frontend/src/app/SvgEditor.tsx
 'use client';
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { message } from 'antd';
 import { fabric } from 'fabric';
-import { Button, Card, message, Spin, Tooltip, Space } from 'antd';
-import { 
-  SaveOutlined,
-  DeleteOutlined, 
-  QuestionCircleOutlined
-} from '@ant-design/icons';
-import { useRouter } from 'next/navigation'; // 👈 新增引入
+import Image from 'next/image';
+import { useEffect, useRef, useState } from 'react';
+import { apiUrl } from './lib/api';
+
+type PromptMode = 'positive' | 'negative' | 'box';
+type PresetKey = 'logo' | 'illustration' | 'photo';
+type VectorMode = 'auto' | 'color' | 'contour';
+
+type PromptPoint = {
+  id: string;
+  x: number;
+  y: number;
+  label: 0 | 1;
+};
+
+type BoxSelection = {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+};
+
+type Candidate = {
+  id: string;
+  label: string;
+  score_percent: number;
+  preview_url: string;
+  svg_url: string;
+  offset_x: number;
+  offset_y: number;
+  vector_mode: string;
+  width: number;
+  height: number;
+};
 
 interface SvgEditorProps {
+  uploadId: string;
   imageUrl: string;
   imageWidth: number;
   imageHeight: number;
+  expiresAt: string;
+  onReset: () => void;
 }
 
-export default function SvgEditor({ imageUrl, imageWidth, imageHeight }: SvgEditorProps) {
-  const canvasEl = useRef<HTMLCanvasElement>(null);
-  const [canvas, setCanvas] = useState<fabric.Canvas | null>(null);
-  
-  const [loading, setLoading] = useState(false);
-  const imgRef = useRef<HTMLImageElement>(null);
-  const router = useRouter(); // 👈 初始化路由
+function normalizeBox(box: BoxSelection): BoxSelection {
+  return {
+    x0: Math.min(box.x0, box.x1),
+    y0: Math.min(box.y0, box.y1),
+    x1: Math.max(box.x0, box.x1),
+    y1: Math.max(box.y0, box.y1),
+  };
+}
 
-  // 画布交互状态 refs
+export default function SvgEditor({
+  uploadId,
+  imageUrl,
+  imageWidth,
+  imageHeight,
+  expiresAt,
+  onReset,
+}: SvgEditorProps) {
+  const canvasEl = useRef<HTMLCanvasElement>(null);
+  const imageFrameRef = useRef<HTMLDivElement>(null);
+  const boxDragStart = useRef<{ x: number; y: number } | null>(null);
+
+  const [canvas, setCanvas] = useState<fabric.Canvas | null>(null);
+  const [promptMode, setPromptMode] = useState<PromptMode>('positive');
+  const [points, setPoints] = useState<PromptPoint[]>([]);
+  const [box, setBox] = useState<BoxSelection | null>(null);
+  const [draftBox, setDraftBox] = useState<BoxSelection | null>(null);
+  const [preset, setPreset] = useState<PresetKey>('photo');
+  const [vectorMode, setVectorMode] = useState<VectorMode>('color');
+  const [detail, setDetail] = useState(2);
+  const [smoothing, setSmoothing] = useState(2);
+  const [keepHoles, setKeepHoles] = useState(true);
+  const [largestComponent, setLargestComponent] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [candidates, setCandidates] = useState<Candidate[]>([]);
+
   const isDragging = useRef(false);
   const lastPosX = useRef(0);
   const lastPosY = useRef(0);
 
-  // --- 删除选中对象的功能 ---
-  const handleDeleteSelected = useCallback(() => {
-    if (!canvas) return;
-    const activeObjects = canvas.getActiveObjects();
-    
-    if (activeObjects.length === 0) {
-        message.warning('请先选择要删除的元素');
-        return;
+  useEffect(() => {
+    if (preset === 'logo') {
+      setLargestComponent(true);
+      setKeepHoles(true);
+    }
+  }, [preset]);
+
+  useEffect(() => {
+    if (!canvasEl.current) {
+      return;
     }
 
-    canvas.discardActiveObject(); // 取消选择状态
-    activeObjects.forEach((obj) => {
-        canvas.remove(obj);
-    });
-    canvas.requestRenderAll(); 
-    message.success('已删除选中元素');
-  }, [canvas]);
-
-  // -------------------------------------------------------------
-  // 🔥 核心修复：Effect 1 - 仅负责初始化画布 (只运行一次)
-  // -------------------------------------------------------------
-  useEffect(() => {
-    if (!canvasEl.current) return;
-
-    // 1. 初始化画布
     const fabricCanvas = new fabric.Canvas(canvasEl.current, {
-      width: canvasEl.current.parentElement?.clientWidth || 800,
+      width: canvasEl.current.parentElement?.clientWidth || 700,
       height: canvasEl.current.parentElement?.clientHeight || 600,
-      backgroundColor: '#f0f2f5',
+      backgroundColor: 'rgba(255,250,241,0.65)',
       preserveObjectStacking: true,
     });
 
-    // 2. 绑定 Fabric 内部事件 (滚轮、拖拽)
     fabricCanvas.on('mouse:wheel', (opt) => {
       const evt = opt.e;
-      if (evt.altKey === true) {
-        let delta = evt.deltaY;
-        let zoom = fabricCanvas.getZoom();
-        zoom *= 0.999 ** delta;
-        if (zoom > 20) zoom = 20;
-        if (zoom < 0.1) zoom = 0.1;
-        fabricCanvas.zoomToPoint({ x: evt.offsetX, y: evt.offsetY }, zoom);
-        evt.preventDefault();
-        evt.stopPropagation();
+      if (evt.altKey !== true) {
+        return;
       }
+      const delta = evt.deltaY;
+      let zoom = fabricCanvas.getZoom();
+      zoom *= 0.999 ** delta;
+      zoom = Math.min(20, Math.max(0.15, zoom));
+      fabricCanvas.zoomToPoint({ x: evt.offsetX, y: evt.offsetY }, zoom);
+      evt.preventDefault();
+      evt.stopPropagation();
     });
 
     fabricCanvas.on('mouse:down', (opt) => {
       const evt = opt.e;
-      if (evt.altKey === true) {
-        isDragging.current = true;
-        fabricCanvas.selection = false;
-        lastPosX.current = evt.clientX;
-        lastPosY.current = evt.clientY;
+      if (evt.altKey !== true) {
+        return;
       }
+      isDragging.current = true;
+      fabricCanvas.selection = false;
+      lastPosX.current = evt.clientX;
+      lastPosY.current = evt.clientY;
     });
+
     fabricCanvas.on('mouse:move', (opt) => {
-      if (isDragging.current) {
-        const e = opt.e;
-        const vpt = fabricCanvas.viewportTransform;
-        if (vpt) {
-            vpt[4] += e.clientX - lastPosX.current;
-            vpt[5] += e.clientY - lastPosY.current;
-            fabricCanvas.requestRenderAll();
-            lastPosX.current = e.clientX;
-            lastPosY.current = e.clientY;
-        }
+      if (!isDragging.current) {
+        return;
       }
+      const event = opt.e;
+      const viewport = fabricCanvas.viewportTransform;
+      if (!viewport) {
+        return;
+      }
+      viewport[4] += event.clientX - lastPosX.current;
+      viewport[5] += event.clientY - lastPosY.current;
+      fabricCanvas.requestRenderAll();
+      lastPosX.current = event.clientX;
+      lastPosY.current = event.clientY;
     });
+
     fabricCanvas.on('mouse:up', () => {
-      if (isDragging.current) {
-        fabricCanvas.setViewportTransform(fabricCanvas.viewportTransform || [1, 0, 0, 1, 0, 0]);
-        isDragging.current = false;
-        fabricCanvas.selection = true;
+      if (!isDragging.current) {
+        return;
       }
+      fabricCanvas.setViewportTransform(
+        fabricCanvas.viewportTransform || [1, 0, 0, 1, 0, 0],
+      );
+      isDragging.current = false;
+      fabricCanvas.selection = true;
     });
 
-    // 3. 将实例保存到 state
-    setCanvas(fabricCanvas);
-
-    // 4. 响应式调整大小
     const resizeObserver = new ResizeObserver(() => {
-        if(canvasEl.current && canvasEl.current.parentElement) {
-            fabricCanvas.setWidth(canvasEl.current.parentElement.clientWidth);
-            fabricCanvas.setHeight(canvasEl.current.parentElement.clientHeight);
-            fabricCanvas.renderAll();
-        }
+      if (!canvasEl.current?.parentElement) {
+        return;
+      }
+      fabricCanvas.setWidth(canvasEl.current.parentElement.clientWidth);
+      fabricCanvas.setHeight(canvasEl.current.parentElement.clientHeight);
+      fabricCanvas.renderAll();
     });
-    if(canvasEl.current.parentElement) {
-        resizeObserver.observe(canvasEl.current.parentElement);
+
+    if (canvasEl.current.parentElement) {
+      resizeObserver.observe(canvasEl.current.parentElement);
     }
 
+    setCanvas(fabricCanvas);
+
     return () => {
-      fabricCanvas.dispose();
       resizeObserver.disconnect();
+      fabricCanvas.dispose();
     };
   }, []);
 
-  // -------------------------------------------------------------
-  // 🔥 核心修复：Effect 2 - 负责绑定键盘事件 (依赖 canvas 更新)
-  // -------------------------------------------------------------
   useEffect(() => {
-    if (!canvas) return;
+    if (!canvas) {
+      return;
+    }
 
-    const handleKeyDown = (e: KeyboardEvent) => {
-        if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
-            return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        const activeObjects = canvas.getActiveObjects();
+        if (activeObjects.length === 0) {
+          return;
         }
-        if (e.key === 'Delete' || e.key === 'Backspace') {
-            handleDeleteSelected();
-        }
+        canvas.discardActiveObject();
+        activeObjects.forEach((object) => canvas.remove(object));
+        canvas.requestRenderAll();
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [canvas]);
 
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [canvas, handleDeleteSelected]);
-
-
-  // 处理左侧点击：调用 SAM
-  const handleImageClick = async (e: React.MouseEvent<HTMLImageElement>) => {
-    if (loading || !imgRef.current) return;
-
-    // 🔥 1. 检查登录状态
-    const token = localStorage.getItem('smart_svg_token');
-    if (!token) {
-        message.error('请先登录！');
-        router.push('/login');
-        return;
+  const getRelativePoint = (event: React.PointerEvent<HTMLDivElement> | React.MouseEvent<HTMLDivElement>) => {
+    const frame = imageFrameRef.current;
+    if (!frame) {
+      return null;
     }
-    
-    const rect = imgRef.current.getBoundingClientRect();
+
+    const rect = frame.getBoundingClientRect();
     const scaleX = imageWidth / rect.width;
     const scaleY = imageHeight / rect.height;
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
+    const x = Math.min(imageWidth, Math.max(0, (event.clientX - rect.left) * scaleX));
+    const y = Math.min(imageHeight, Math.max(0, (event.clientY - rect.top) * scaleY));
+    return { x, y };
+  };
+
+  const handlePromptClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (promptMode === 'box' || loading) {
+      return;
+    }
+    const point = getRelativePoint(event);
+    if (!point) {
+      return;
+    }
+    setPoints((current) => [
+      ...current,
+      {
+        id: `${Date.now()}-${current.length}`,
+        x: point.x,
+        y: point.y,
+        label: promptMode === 'positive' ? 1 : 0,
+      },
+    ]);
+  };
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (promptMode !== 'box' || loading) {
+      return;
+    }
+    const point = getRelativePoint(event);
+    if (!point) {
+      return;
+    }
+    boxDragStart.current = point;
+    setDraftBox({ x0: point.x, y0: point.y, x1: point.x, y1: point.y });
+  };
+
+  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!boxDragStart.current || promptMode !== 'box') {
+      return;
+    }
+    const point = getRelativePoint(event);
+    if (!point) {
+      return;
+    }
+    setDraftBox({
+      x0: boxDragStart.current.x,
+      y0: boxDragStart.current.y,
+      x1: point.x,
+      y1: point.y,
+    });
+  };
+
+  const handlePointerUp = () => {
+    if (!draftBox) {
+      return;
+    }
+    const normalized = normalizeBox(draftBox);
+    if (Math.abs(normalized.x1 - normalized.x0) < 6 || Math.abs(normalized.y1 - normalized.y0) < 6) {
+      setDraftBox(null);
+      boxDragStart.current = null;
+      return;
+    }
+    setBox(normalized);
+    setDraftBox(null);
+    boxDragStart.current = null;
+  };
+
+  const extractCandidates = async () => {
+    if (loading) {
+      return;
+    }
+    if (points.length === 0 && !box) {
+      message.warning('至少添加一个正点、负点，或者画一个框。');
+      return;
+    }
 
     setLoading(true);
-    message.loading({ content: 'AI 正在识别并抠图...', key: 'sam_process', duration: 0 });
+    try {
+      const formData = new FormData();
+      formData.append('upload_id', uploadId);
+      formData.append('points_json', JSON.stringify(points));
+      if (box) {
+        formData.append('box_json', JSON.stringify(box));
+      }
+      formData.append('preset', preset);
+      formData.append('vector_mode', vectorMode);
+      formData.append('detail', String(detail));
+      formData.append('smoothing', String(smoothing));
+      formData.append('keep_holes', String(keepHoles));
+      formData.append('largest_component', String(largestComponent));
+
+      const response = await fetch(apiUrl('/segment/'), {
+        method: 'POST',
+        body: formData,
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.detail || '分割失败。');
+      }
+
+      setCandidates(payload.candidates || []);
+      message.success('候选结果已生成，先挑一个最合适的再加入画布。');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : '分割失败。';
+      message.error(errorMessage);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const addCandidateToCanvas = (candidate: Candidate) => {
+    if (!canvas) {
+      return;
+    }
+
+    if (candidate.vector_mode === 'masked-image') {
+      void addMaskedImageCandidateToCanvas(candidate);
+      return;
+    }
+
+    fabric.loadSVGFromURL(apiUrl(candidate.svg_url), (objects, options) => {
+      if (!objects || objects.length === 0) {
+        message.error('候选 SVG 解析失败，请重新生成候选结果。');
+        return;
+      }
+
+      const svgGroup = fabric.util.groupSVGElements(objects, options);
+      svgGroup.set({
+        left: candidate.offset_x,
+        top: candidate.offset_y,
+        perPixelTargetFind: true,
+      });
+
+      canvas.add(svgGroup);
+      canvas.setActiveObject(svgGroup);
+      canvas.requestRenderAll();
+      message.success(`${candidate.label} 候选已加入画布。`);
+    });
+  };
+
+  const addMaskedImageCandidateToCanvas = async (candidate: Candidate) => {
+    if (!canvas) {
+      return;
+    }
 
     try {
-        const formData = new FormData();
-        formData.append('x', x.toString());
-        formData.append('y', y.toString());
+      const response = await fetch(apiUrl(candidate.preview_url));
+      if (!response.ok) {
+        throw new Error('预览图加载失败。');
+      }
 
-        // 🔥 2. 发送带 Token 的请求
-        const res = await fetch('/segment/', {
-            method: 'POST',
-            body: formData,
-            headers: {
-                'Authorization': `Bearer ${token}` // 👈 关键：添加认证头
-            }
-        });
-        
-        // 🔥 3. 处理 Token 过期的情况
-        if (res.status === 401) {
-             message.error({ content: '登录已过期，请重新登录', key: 'sam_process' });
-             router.push('/login');
-             return;
-        }
+      const blob = await response.blob();
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (typeof reader.result === 'string') {
+            resolve(reader.result);
+            return;
+          }
+          reject(new Error('预览图读取失败。'));
+        };
+        reader.onerror = () => reject(new Error('预览图读取失败。'));
+        reader.readAsDataURL(blob);
+      });
 
-        if (!res.ok) {
-             const err = await res.json();
-             throw new Error(err.detail || '识别失败');
-        }
-
-        const data = await res.json();
-        if (data.svg_url) {
-            fabric.loadSVGFromURL(data.svg_url, (objects, options) => {
-                const svgGroup = fabric.util.groupSVGElements(objects, options);
-                svgGroup.set({
-                    left: data.offset_x,
-                    top: data.offset_y,
-                    perPixelTargetFind: true,
-                });
-                
-                if (canvas) {
-                    canvas.add(svgGroup);
-                    canvas.setActiveObject(svgGroup);
-                    canvas.renderAll();
-                    message.success({ content: '模块已提取！', key: 'sam_process' });
-                }
-            });
-        }
-    } catch (error: any) {
-        console.error(error);
-        message.error({ content: error.message || '识别失败', key: 'sam_process' });
-    } finally {
-        setLoading(false);
+      fabric.Image.fromURL(
+        dataUrl,
+        (image) => {
+          image.set({
+            left: candidate.offset_x,
+            top: candidate.offset_y,
+            selectable: true,
+          });
+          canvas.add(image);
+          canvas.setActiveObject(image);
+          canvas.requestRenderAll();
+          message.success(`${candidate.label} 候选已加入画布。`);
+        },
+        { crossOrigin: 'anonymous' },
+      );
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : '预览图加载失败。';
+      message.error(errorMessage);
     }
   };
 
-  // 导出 SVG (保持不变)
-  const handleDownload = () => {
-    if (!canvas) return;
+  const exportCanvas = () => {
+    if (!canvas) {
+      return;
+    }
 
-    const activeObj = canvas.getActiveObject();
-    const triggerDownload = (svgString: string, prefix: string) => {
-        const blob = new Blob([svgString], {type: "image/svg+xml"});
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `${prefix}_smart_disassembled.svg`;
-        link.click();
-        URL.revokeObjectURL(url);
+    const activeObject = canvas.getActiveObject();
+    const download = (content: string, fileName: string) => {
+      const blob = new Blob([content], { type: 'image/svg+xml' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      link.click();
+      URL.revokeObjectURL(url);
     };
 
-    if (activeObj) {
-        message.loading({ content: '正在导出选中模块...', key: 'export' });
-        activeObj.clone((cloned: fabric.Object) => {
-            const padding = 10;
-            const width = cloned.getScaledWidth() + padding * 2;
-            const height = cloned.getScaledHeight() + padding * 2;
-
-            const tempCanvas = new fabric.StaticCanvas(null, {
-                width: width,
-                height: height,
-                backgroundColor: 'transparent'
-            });
-
-            cloned.set({
-                left: padding,
-                top: padding,
-                originX: 'left',
-                originY: 'top'
-            });
-
-            if (activeObj.type === 'activeSelection') {
-                tempCanvas.add(cloned);
-                tempCanvas.centerObject(cloned);
-            } else {
-                tempCanvas.add(cloned);
-            }
-            
-            const svgData = tempCanvas.toSVG();
-            triggerDownload(svgData, 'selected');
-            tempCanvas.dispose();
-            message.success({ content: '选中模块已导出 (透明背景)', key: 'export' });
+    if (activeObject) {
+      activeObject.clone((cloned: fabric.Object) => {
+        const padding = 12;
+        const tempCanvas = new fabric.StaticCanvas(null, {
+          width: cloned.getScaledWidth() + padding * 2,
+          height: cloned.getScaledHeight() + padding * 2,
+          backgroundColor: 'transparent',
         });
 
-    } else {
-        message.loading({ content: '正在导出全图...', key: 'export' });
-        const originalBg = canvas.backgroundColor;
-        const originalVpt = canvas.viewportTransform;
-        
-        canvas.setBackgroundColor(null as any, () => {});
-        canvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
-        const currentW = canvas.getWidth();
-        const currentH = canvas.getHeight();
-        canvas.setWidth(imageWidth);
-        canvas.setHeight(imageHeight);
-
-        const svgData = canvas.toSVG();
-
-        canvas.setWidth(currentW);
-        canvas.setHeight(currentH);
-        if (originalVpt) canvas.setViewportTransform(originalVpt);
-        canvas.setBackgroundColor(originalBg as string, canvas.renderAll.bind(canvas));
-
-        triggerDownload(svgData, 'full');
-        message.success({ content: '全图已导出 (透明背景)', key: 'export' });
+        cloned.set({
+          left: padding,
+          top: padding,
+          originX: 'left',
+          originY: 'top',
+        });
+        tempCanvas.add(cloned);
+        download(tempCanvas.toSVG(), 'selected-smart-svg.svg');
+        tempCanvas.dispose();
+      });
+      return;
     }
+
+    const originalBackground = canvas.backgroundColor;
+    const originalViewport = canvas.viewportTransform;
+    const originalWidth = canvas.getWidth();
+    const originalHeight = canvas.getHeight();
+
+    canvas.setBackgroundColor(null as never, () => {});
+    canvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
+    canvas.setWidth(imageWidth);
+    canvas.setHeight(imageHeight);
+    const svg = canvas.toSVG();
+
+    canvas.setWidth(originalWidth);
+    canvas.setHeight(originalHeight);
+    if (originalViewport) {
+      canvas.setViewportTransform(originalViewport);
+    }
+    canvas.setBackgroundColor(originalBackground as string, canvas.renderAll.bind(canvas));
+
+    download(svg, 'full-smart-svg.svg');
   };
 
-  const cardExtra = (
-    <Space>
-      <Tooltip title="快捷键：Delete 或 Backspace">
-        <Button danger icon={<DeleteOutlined />} onClick={handleDeleteSelected}>删除选中</Button>
-      </Tooltip>
-      <Button type="primary" icon={<SaveOutlined />} onClick={handleDownload}>导出 SVG</Button>
-    </Space>
-  );
+  const renderBox = (targetBox: BoxSelection, dashed: boolean) => {
+    const left = (targetBox.x0 / imageWidth) * 100;
+    const top = (targetBox.y0 / imageHeight) * 100;
+    const width = ((targetBox.x1 - targetBox.x0) / imageWidth) * 100;
+    const height = ((targetBox.y1 - targetBox.y0) / imageHeight) * 100;
+    return (
+      <div
+        className={`absolute rounded-[18px] border ${dashed ? 'border-dashed border-[var(--accent-cool)] bg-[rgba(46,125,115,0.08)]' : 'border-solid border-[var(--accent)] bg-[rgba(228,87,46,0.08)]'}`}
+        style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%` }}
+      />
+    );
+  };
 
   return (
-    <div className="flex h-[75vh] gap-4 items-stretch">
-      <Card 
-        title={
-            <Space>
-                <span>1. 点击提取 (已自动抹除文本)</span>
-                <Tooltip title="后端已使用 OCR 技术识别并自动修复了图片中的文本区域，点击提取时不再受文字干扰。">
-                    <QuestionCircleOutlined className="text-gray-400 cursor-help"/>
-                </Tooltip>
-            </Space>
-        }
-        className="w-1/2 shadow-md flex flex-col" 
-        styles={{ body: { flex: 1, position: 'relative', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#fafafa' } }}
-      >
-         <div className="relative w-full h-full flex items-center justify-center cursor-crosshair overflow-auto">
-            {loading && (
-              <div className="absolute inset-0 bg-white/60 z-10 flex flex-col gap-2 items-center justify-center pointer-events-none">
-                  <Spin size="large" />
-                  <span className="text-blue-600 font-medium">AI 思考中...</span>
-              </div>
-            )}
-            <img 
-                ref={imgRef}
-                src={imageUrl} 
-                alt="Source" 
-                className="max-w-full max-h-full object-contain select-none shadow-sm"
-                onClick={handleImageClick}
-                draggable={false}
-            />
-         </div>
-      </Card>
+    <div className="grid gap-6">
+      <section className="glass-panel-strong grid gap-6 rounded-[32px] p-6 lg:grid-cols-[1.08fr_0.92fr]">
+        <div className="space-y-5">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <p className="display-face text-3xl font-bold">分割工作台</p>
+              <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
+                上传任务：<span className="font-semibold text-[var(--text)]">{uploadId}</span>
+                <br />
+                过期时间：{new Date(expiresAt).toLocaleString()}
+              </p>
+            </div>
+            <button className="ink-button ink-button-muted" onClick={onReset} type="button">
+              返回上传区
+            </button>
+          </div>
 
-      <Card 
-        title="2. 矢量组装画布 (Alt+缩放/平移)" 
-        className="w-1/2 shadow-md flex flex-col"
-        styles={{ body: { padding: 0, flex: 1, position: 'relative', display: 'flex' } }}
-        extra={cardExtra}
-      >
-        <div className="flex-1 w-full h-full bg-gray-100 relative overflow-hidden">
-            <canvas ref={canvasEl} className="absolute top-0 left-0"/>
+          <div className="glass-panel rounded-[28px] p-4">
+            <div className="flex flex-wrap gap-2">
+              {[
+                { key: 'positive', label: '正点' },
+                { key: 'negative', label: '负点' },
+                { key: 'box', label: '框选' },
+              ].map((item) => (
+                <button
+                  className={`mode-button ${promptMode === item.key ? 'mode-button-active' : ''}`}
+                  key={item.key}
+                  onClick={() => setPromptMode(item.key as PromptMode)}
+                  type="button"
+                >
+                  {item.label}
+                </button>
+              ))}
+              <button className="mode-button" onClick={() => setPoints([])} type="button">
+                清空点
+              </button>
+              <button className="mode-button" onClick={() => setBox(null)} type="button">
+                清空框
+              </button>
+              <button className="ink-button ink-button-primary ml-auto" onClick={extractCandidates} type="button">
+                {loading ? '处理中...' : '生成候选'}
+              </button>
+            </div>
+
+            <div className="mt-4 text-sm leading-6 text-[var(--muted)]">
+              点一下添加正点或负点；切到框选后拖拽限定主体范围。复杂背景优先加几个负点，把不想要的区域明确排掉。
+            </div>
+
+            <div className="mt-5 overflow-hidden rounded-[28px] border border-[rgba(24,21,17,0.1)] bg-[rgba(255,253,249,0.94)] p-3">
+              <div
+                className="relative inline-block max-w-full cursor-crosshair"
+                onClick={handlePromptClick}
+                onPointerDown={handlePointerDown}
+                onPointerMove={handlePointerMove}
+                onPointerUp={handlePointerUp}
+                ref={imageFrameRef}
+              >
+                <Image
+                  alt="Uploaded source"
+                  className="max-h-[560px] max-w-full rounded-[20px] object-contain select-none"
+                  draggable={false}
+                  height={imageHeight}
+                  priority
+                  src={apiUrl(imageUrl)}
+                  unoptimized
+                  width={imageWidth}
+                />
+
+                {points.map((point) => (
+                  <div
+                    className="absolute h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow"
+                    key={point.id}
+                    style={{
+                      left: `${(point.x / imageWidth) * 100}%`,
+                      top: `${(point.y / imageHeight) * 100}%`,
+                      backgroundColor: point.label === 1 ? 'var(--success)' : 'var(--accent)',
+                    }}
+                  />
+                ))}
+
+                {box && renderBox(box, false)}
+                {draftBox && renderBox(normalizeBox(draftBox), true)}
+              </div>
+            </div>
+          </div>
         </div>
-      </Card>
+
+        <div className="space-y-5">
+          <div className="glass-panel rounded-[28px] p-5">
+            <p className="display-face text-2xl font-bold">质量控制</p>
+            <div className="mt-5 grid gap-4 sm:grid-cols-2">
+              <label className="text-sm font-semibold text-[var(--text)]">
+                图像预设
+                <select className="control-select mt-2" onChange={(event) => setPreset(event.target.value as PresetKey)} value={preset}>
+                  <option value="logo">Logo / 图标</option>
+                  <option value="illustration">插画 / 贴纸</option>
+                  <option value="photo">照片 / 复杂主体</option>
+                </select>
+              </label>
+
+              <label className="text-sm font-semibold text-[var(--text)]">
+                矢量模式
+                <select className="control-select mt-2" onChange={(event) => setVectorMode(event.target.value as VectorMode)} value={vectorMode}>
+                  <option value="auto">Auto</option>
+                  <option value="color">Color Vector</option>
+                  <option value="contour">Contour</option>
+                </select>
+              </label>
+
+              <label className="text-sm font-semibold text-[var(--text)]">
+                细节等级
+                <input className="control-slider mt-3" max={3} min={1} onChange={(event) => setDetail(Number(event.target.value))} type="range" value={detail} />
+                <p className="mt-2 text-xs font-medium text-[var(--muted)]">1 更干净，3 更保留细节</p>
+              </label>
+
+              <label className="text-sm font-semibold text-[var(--text)]">
+                平滑等级
+                <input className="control-slider mt-3" max={3} min={1} onChange={(event) => setSmoothing(Number(event.target.value))} type="range" value={smoothing} />
+                <p className="mt-2 text-xs font-medium text-[var(--muted)]">1 更锐，3 更圆润</p>
+              </label>
+            </div>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <label className="flex items-center gap-3 rounded-[20px] border border-[rgba(24,21,17,0.08)] bg-[rgba(255,252,247,0.9)] px-4 py-3 text-sm font-semibold text-[var(--text)]">
+                <input checked={keepHoles} onChange={(event) => setKeepHoles(event.target.checked)} type="checkbox" />
+                保留内部孔洞
+              </label>
+              <label className="flex items-center gap-3 rounded-[20px] border border-[rgba(24,21,17,0.08)] bg-[rgba(255,252,247,0.9)] px-4 py-3 text-sm font-semibold text-[var(--text)]">
+                <input checked={largestComponent} onChange={(event) => setLargestComponent(event.target.checked)} type="checkbox" />
+                仅保留最大连通域
+              </label>
+            </div>
+          </div>
+
+          <div className="glass-panel rounded-[28px] p-5">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="display-face text-2xl font-bold">候选结果</p>
+                <p className="mt-2 text-sm text-[var(--muted)]">先看预览，再把合适的 SVG 加进画布。</p>
+              </div>
+              <span className="ink-pill">{candidates.length} candidates</span>
+            </div>
+
+            <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+              {candidates.map((candidate) => (
+                <div className="candidate-card" key={candidate.id}>
+                  <div className="relative aspect-[4/3] bg-[rgba(248,242,233,0.9)] p-3">
+                    <Image
+                      alt={candidate.label}
+                      className="rounded-[18px] object-contain"
+                      fill
+                      sizes="(max-width: 768px) 100vw, 30vw"
+                      src={apiUrl(candidate.preview_url)}
+                      unoptimized
+                    />
+                  </div>
+                  <div className="space-y-3 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="font-bold text-[var(--text)]">{candidate.label}</p>
+                      <span className="text-xs font-bold uppercase tracking-[0.12em] text-[var(--muted)]">
+                        {candidate.vector_mode}
+                      </span>
+                    </div>
+                    <p className="text-sm text-[var(--muted)]">SAM score {candidate.score_percent.toFixed(1)}%</p>
+                    <button className="ink-button ink-button-primary w-full" onClick={() => addCandidateToCanvas(candidate)} type="button">
+                      加入画布
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {candidates.length === 0 ? (
+              <div className="mt-5 rounded-[24px] border border-dashed border-[rgba(24,21,17,0.15)] bg-[rgba(255,252,247,0.72)] px-5 py-8 text-sm leading-7 text-[var(--muted)]">
+                还没有候选结果。先在左侧放点或框，再点击“生成候选”。
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </section>
+
+      <section className="glass-panel-strong rounded-[32px] p-6">
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <p className="display-face text-3xl font-bold">SVG 拼装画布</p>
+            <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
+              `Alt + 滚轮` 缩放，`Alt + 拖动` 平移，`Delete / Backspace` 删除选中对象。
+            </p>
+          </div>
+          <button className="ink-button ink-button-primary" onClick={exportCanvas} type="button">
+            导出 SVG
+          </button>
+        </div>
+
+        <div className="h-[640px] overflow-hidden rounded-[30px] border border-[rgba(24,21,17,0.12)] bg-[rgba(255,251,246,0.9)]">
+          <canvas className="h-full w-full" ref={canvasEl} />
+        </div>
+      </section>
     </div>
   );
 }

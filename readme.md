@@ -1,193 +1,303 @@
-# Smart SVG Tool (基于 SAM 的智能图片拆解与矢量化工具)
+# Smart SVG Tool
 
-这是一个基于 AI 的智能图片处理工具，能够利用 **Segment Anything Model (SAM)** 进行语义分割，并使用 **VTracer** 将位图转换为高质量的 SVG 矢量图。前端提供了一个强大的 **Fabric.js** 画布，支持对拆解后的矢量模块进行自由组合、缩放和导出。
+一个把位图主体拆出来并转成 SVG 的工具，当前版本重点做了三件事：
 
-## ✨ 主要功能
+- 分割链路从“单点 + 单结果”升级成“正点 / 负点 / 框选 + 3 个候选结果”
+- SVG 输出从单一路线升级成 `Contour` 与 `Color Vector` 双路线
+- 后端从进程级全局状态升级成基于 `upload_id` 的任务隔离
 
-* **AI 智能拆解**：点击图片任意位置，利用 SAM 模型自动识别主体并抠图。
-* **图像增强**：内置 OpenCV 锐化处理，提升非水彩风格图片（如插画、照片）的转换清晰度。
-* **矢量化转换**：将抠图结果转换为可编辑的 SVG 路径。
-* **交互式画布**：支持拖拽、缩放、组合、删除矢量元素。
-* **灵活导出**：支持导出选中模块或全图，自动处理透明背景。
+这次重构优先解决的是图片分割质量、SVG 转换质量，以及可继续部署和维护的工程结构。
 
----
+## 这版重点改了什么
 
-## 🛠️ 环境配置 (Prerequisites)
+### 1. 分割质量
 
-### 1. 基础环境
+- 上传后会返回 `upload_id`，后续所有分割都基于任务隔离，不再依赖单个全局 `current_image_path`
+- 支持 `正点击 / 负点击 / 框选`
+- 每次分割返回 3 个候选结果，避免“一次给错就结束”
+- mask 在送去矢量化前会统一经过：
+  - 去小噪点
+  - 填小孔洞
+  - 平滑边缘
+  - 可选只保留最大连通域
 
-* **Python**: 3.8 或更高版本 (推荐 3.10)
-* **Node.js**: 16.0 或更高版本
-* **Git**
+### 2. SVG 质量
 
-### 2. 后端配置 (Backend)
+- 新增 3 套图像预设：
+  - `Logo / Icon`
+  - `Illustration / Sticker`
+  - `Photo / Complex Subject`
+- 新增 2 条矢量化路线：
+  - `Contour`：直接从 mask 轮廓提 path，适合 logo、图标、边界清晰对象
+  - `Color Vector`：走 VTracer，适合插画、贴纸、复杂色块主体
+- 提供 `detail` 和 `smoothing` 控制项，用于平衡“更干净”和“更保留细节”
+- 当彩色矢量化失败时，后端会自动回退到 contour 模式，避免直接报废
 
-进入 `backend` 目录并安装依赖：
+### 3. 产品体验
+
+- 首页不再强制登录
+- 登录 / 注册保留，但上传和分割现在允许直接试用
+- 前端工作流改成：
+  1. 上传图片
+  2. 添加提示点或框
+  3. 查看候选结果
+  4. 选中合适的 SVG 加入画布
+  5. 在 Fabric 画布中拼装后导出
+
+### 4. 工程能力
+
+- 敏感配置全部改为环境变量
+- 默认数据库改成 SQLite，开箱更轻；如果需要，也可以通过 `DATABASE_URL` 切回 Postgres
+- 增加 `.env.example`
+- 增加后端 / 前端 Dockerfile
+- 更新根目录 `docker-compose.yml`
+- 临时任务和导出文件统一写入 `backend/runtime`
+
+## 当前技术栈
+
+- Backend: FastAPI + SQLAlchemy + SAM + OpenCV + VTracer
+- Frontend: Next.js 16 + React 19 + Fabric.js + Tailwind CSS
+- Auth: JWT
+- Default DB: SQLite
+
+## 目录说明
+
+```text
+smart_svg_tools/
+├─ backend/
+│  ├─ app/
+│  │  ├─ auth.py
+│  │  ├─ config.py
+│  │  ├─ crud.py
+│  │  ├─ database.py
+│  │  ├─ models.py
+│  │  ├─ schemas.py
+│  │  ├─ segmentation.py
+│  │  └─ task_store.py
+│  ├─ weights/
+│  ├─ runtime/
+│  ├─ Dockerfile
+│  ├─ main.py
+│  └─ requirements.txt
+├─ frontend/
+│  ├─ app/
+│  ├─ public/
+│  ├─ Dockerfile
+│  └─ package.json
+├─ .env.example
+├─ docker-compose.yml
+└─ readme.md
+```
+
+## 快速开始
+
+### 1. 准备模型文件
+
+下载 SAM 权重并放到：
+
+```text
+backend/weights/sam_vit_b_01ec64.pth
+```
+
+推荐下载地址：
+
+```text
+https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+```
+
+### 2. 准备环境变量
+
+在仓库根目录复制：
+
+```bash
+cp .env.example .env
+```
+
+Windows 可以直接手动复制一份 `.env.example` 为 `.env`。
+
+默认关键配置：
+
+```env
+DATABASE_URL=sqlite:///./runtime/smart_svg.db
+SAM_CHECKPOINT_PATH=./weights/sam_vit_b_01ec64.pth
+RUNTIME_DIR=./runtime
+FRONTEND_DIST_DIR=../frontend/out
+NEXT_PUBLIC_API_BASE_URL=
+```
+
+说明：
+
+- 这些路径都是相对于 `backend/` 目录解释的
+- 如果前后端分离部署，前端需要设置 `NEXT_PUBLIC_API_BASE_URL`
+
+## 本地开发
+
+### 后端
 
 ```bash
 cd backend
-
-# 1. (可选) 创建虚拟环境
-conda create -n smart_svg python=3.10
-conda activate smart_svg
-
-# 2. 安装 Python 依赖
-# 注意：如果你有 NVIDIA 显卡，请先安装 PyTorch 的 CUDA 版本，否则可能会默认安装 CPU 版
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
-
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-**依赖列表 (`requirements.txt` 参考):**
+如果你要使用 GPU 版 PyTorch，请按你的 CUDA 版本安装对应 wheel，再装其余依赖。
 
-```txt
-fastapi
-uvicorn
-python-multipart
-numpy
-Pillow
-opencv-python-headless
-segment-anything
-vtracer
-paddlepaddle
-paddleocr
-
-```
-
-**模型文件下载:**
-你需要手动下载 SAM 模型权重文件，并将其放入 `backend` 目录：
-
-* **模型名称**: `sam_vit_b_01ec64.pth`
-* **下载地址**: [Facebook SAM Model Checkpoint](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth)
-
-> **注意**: PaddleOCR 的模型会在第一次运行时自动下载到 `backend/paddle_home` 目录下，无需手动干预。
-
-### 3. 前端配置 (Frontend)
-
-进入 `frontend` 目录并安装依赖：
+### 前端
 
 ```bash
 cd frontend
 npm install
-
+npm run dev
 ```
 
----
+默认访问：
 
-## 🚀 运行项目 (Running)
+- Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:8000`
 
-本项目支持 **前后端分离开发模式** 和 **整合托管模式**。
+## 静态构建 + 后端托管
 
-### 方式一：整合模式 (推荐，只需启动 Python)
+如果你想让 FastAPI 直接托管前端静态页面：
 
-这种方式由 Python 后端直接托管前端页面，适合部署或直接使用。
-
-1. **构建前端**:
 ```bash
 cd frontend
+npm install
 npm run build
 
+cd ../backend
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+此时后端会读取 `../frontend/out` 作为静态站点目录。
 
-*(构建成功后会生成 `out` 文件夹)*
-2. **启动后端**:
+## Docker Compose
+
+根目录执行：
+
 ```bash
-cd backend
-python main.py
-
+docker compose up --build
 ```
 
+默认端口：
 
-3. **访问**: 打开浏览器访问 `http://localhost:8000`
+- Frontend: `3000`
+- Backend: `8000`
 
-### 方式二：开发模式 (调试用)
+注意：
 
-如果你需要修改前端代码，可以使用此模式。
+- Compose 默认让前后端分离运行
+- 后端容器会把 `backend/runtime` 挂载出来
+- 请先确保 `backend/weights/sam_vit_b_01ec64.pth` 已存在
 
-1. **启动后端**: `cd backend` -> `python main.py`
-2. **启动前端**: `cd frontend` -> `npm run dev`
-3. **访问**: 打开浏览器访问 `http://localhost:3000`
+## 使用方式
 
----
+### 工作流
 
-## 🎨 VTracer 参数调整与高细节配置
+1. 上传图片
+2. 选择提示方式
+   - 正点：告诉模型“我要这个”
+   - 负点：告诉模型“不要这个”
+   - 框选：限定主体范围
+3. 选择图像预设和矢量模式
+4. 点击“生成候选”
+5. 从 `Tight / Balanced / Complete` 里选一个更合适的结果
+6. 加入右侧画布并导出 SVG
 
-本项目默认使用 **高细节 (High Detail)** 配置，以应对插画和照片风格的清晰度问题。如果你处理的是 **水彩风格** 图片，或者发现生成的 SVG 节点过多、文件过大，可以按以下说明调整参数。
+### 质量建议
 
-### 修改位置
+- Logo / 图标
+  - 预设：`Logo / Icon`
+  - 模式：优先 `Contour`
+  - 建议：勾选“仅保留最大连通域”
 
-打开 `backend/main.py` 文件，找到 `segment_point` 函数中的 `vtracer.convert_image_to_svg_py` 调用部分。
+- 插画 / 贴纸
+  - 预设：`Illustration / Sticker`
+  - 模式：优先 `Auto` 或 `Color Vector`
+  - 建议：先加一个正点，再用负点清背景粘连
 
-### 参数详解
+- 照片主体
+  - 预设：`Photo / Complex Subject`
+  - 模式：优先 `Color Vector`
+  - 建议：尽量同时配合框选和负点
 
-| 参数名 | 当前高细节值 | 说明 | 调整建议 |
-| --- | --- | --- | --- |
-| **`filter_speckle`** | `2` | 噪点过滤阈值。值越小，保留的微小细节越多。 | **水彩/简约风**: 改为 `4` 或 `10`，去除杂色。<br>
+## API 概览
 
-<br>**照片/插画**: 保持 `2` 或 `1`。 |
-| **`color_precision`** | `8` | 颜色精度 (位)。值越高，颜色层级越丰富。 | **文件过大时**: 降为 `6`。<br>
+### `POST /upload/`
 
-<br>**追求色彩还原**: 保持 `8`。 |
-| **`layer_difference`** | `10` | 颜色合并阈值。值越小，越能区分相似颜色。 | **色块分明时**: 改为 `16`。<br>
+上传图片，返回：
 
-<br>**渐变丰富时**: 保持 `10`。 |
-| **`path_precision`** | `2` | 路径拟合精度。值越小，线条越贴合原图边缘。 | **追求平滑/艺术感**: 改为 `4` 或 `8`。<br>
+- `upload_id`
+- `image_url`
+- `image_width`
+- `image_height`
+- `expires_at`
 
-<br>**追求还原度**: 保持 `2`。 |
-| **`corner_threshold`** | `60` | 拐角阈值。值越大，越倾向于保留尖角。 | **圆润风格**: 降为 `30`。<br>
+### `POST /segment/`
 
-<br>**硬朗风格**: 保持 `60`。 |
+主要字段：
 
-### 针对不同风格的推荐配置
+- `upload_id`
+- `points_json`
+- `box_json`
+- `preset`
+- `vector_mode`
+- `detail`
+- `smoothing`
+- `keep_holes`
+- `largest_component`
 
-#### 1. 高细节模式 (默认 - 适合照片、复杂插画)
+返回：
 
-```python
-vtracer.convert_image_to_svg_py(
-    # ...
-    filter_speckle=2,       # 保留微小纹理
-    color_precision=8,      # 高色彩精度
-    layer_difference=10,    # 敏感的颜色区分
-    corner_threshold=60,    # 保留锐利边缘
-    path_precision=2        # 极高的路径贴合度
-)
+- `candidates[]`
+  - `label`
+  - `score_percent`
+  - `preview_url`
+  - `svg_url`
+  - `offset_x`
+  - `offset_y`
 
-```
+### `POST /token`
 
-#### 2. 水彩/扁平化模式 (适合 Logo、水彩画)
+账号登录，返回 JWT。
 
-如果你觉得生成的 SVG 太碎、太乱，请尝试改回以下参数：
+### `POST /users/`
 
-```python
-vtracer.convert_image_to_svg_py(
-    # ...
-    filter_speckle=4,       # 过滤噪点
-    color_precision=6,      # 标准色彩
-    layer_difference=16,    # 合并相似色块
-    corner_threshold=45,    # 平滑拐角
-    path_precision=4        # 标准路径精度
-)
+账号注册。
 
-```
+### `GET /me`
 
----
+返回当前登录用户。
 
-## 🤝 常见问题 (Troubleshooting)
+### `GET /health`
 
-1. **OCR 模型下载失败**:
-* 项目会自动将 PaddleOCR 模型下载到 `backend/paddle_home`。如果下载卡住，请检查网络或手动下载模型放入该目录。
+检查服务状态、模型加载状态和设备信息。
 
+## 当前行为变化
 
-2. **前端上传失败**:
-* 如果是局域网或公网访问，请确保 `action` 路径配置正确（整合模式下默认为 `/upload/`）。
+和旧版本相比，以下行为已经明确变化：
 
+- 不再宣传 OCR 自动去字
+- 不再要求先登录才能上传和分割
+- 不再使用单个全局图像状态
+- 不再只返回一个 mask
 
-3. **缺少 'sam_vit_b_01ec64.pth'**:
-* 后端启动会报错，请务必从上方链接下载并放入 `backend` 根目录。
+## 已完成的验证
 
+- 后端：`python -m compileall backend`
+- 前端：`npm run lint`
+- 前端：`npm run build`
 
+## 我建议你下一步优先做的事
 
-## 📝 License
+如果继续往产品化走，最值得追加的是：
 
-[MIT](https://www.google.com/search?q=LICENSE)
+1. 项目保存和历史记录
+2. SVG / PNG / ZIP 多格式导出
+3. 更细的结果分享和收费分层
+4. 上传限流、任务队列和监控
+
+## License
+
+MIT
