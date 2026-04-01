@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from . import crud, database
 from .config import settings
+from .plans import has_basic_access
 
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
@@ -68,4 +69,18 @@ async def get_current_user(
     user = await get_current_user_optional(token=token, db=db)
     if user is None:
         raise _credentials_exception()
+    return user
+
+
+async def get_current_user_with_basic_access(
+    user=Depends(get_current_user),
+):
+    if not has_basic_access(getattr(user, "plan", None)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This account is not activated for the Founder Lifetime Basic plan yet. "
+                "Please register with your purchase email and grant access for that email."
+            ),
+        )
     return user

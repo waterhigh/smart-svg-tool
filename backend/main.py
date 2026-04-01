@@ -36,7 +36,7 @@ segmentation_service = SegmentationService(task_store)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    models.Base.metadata.create_all(bind=database.engine)
+    database.ensure_schema()
     task_store.cleanup_expired()
     segmentation_service.load()
     yield
@@ -156,7 +156,7 @@ async def login_for_access_token(
 @app.post("/upload/")
 async def upload_image(
     file: UploadFile = File(...),
-    current_user: schemas.User | None = Depends(auth.get_current_user_optional),
+    current_user=Depends(auth.get_current_user_with_basic_access),
 ):
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Please upload a valid image file.")
@@ -198,6 +198,7 @@ async def segment_image(
     smoothing: int = Form(2),
     keep_holes: str = Form("true"),
     largest_component: str | None = Form(None),
+    current_user=Depends(auth.get_current_user_with_basic_access),
 ):
     points = _parse_points(points_json)
     box = _parse_box(box_json)
@@ -228,6 +229,7 @@ async def segment_image(
             "Segmentation completed",
             extra={
                 "upload_id": upload_id,
+                "owner": getattr(current_user, "email", None),
                 "preset": preset,
                 "vector_mode": vector_mode,
                 "candidates": len(candidates),

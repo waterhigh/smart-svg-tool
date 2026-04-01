@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel
 
 
@@ -12,6 +14,13 @@ class UserCreate(UserBase):
 class User(UserBase):
     id: int
     is_active: bool
+    plan: str
+    plan_label: str
+    has_basic_access: bool
+    has_advanced_access: bool
+    is_lifetime_plan: bool
+    plan_granted_at: datetime | None = None
+    plan_note: str | None = None
 
     class Config:
         from_attributes = True

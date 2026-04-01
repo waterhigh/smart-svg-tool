@@ -1,29 +1,54 @@
-# backend/app/crud.py
-from sqlalchemy.orm import Session
-from passlib.context import CryptContext
-from . import models, schemas
+from __future__ import annotations
 
-# 1. 配置密码加密器 (使用 bcrypt 算法)
+from datetime import datetime, timezone
+
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+
+from . import models, schemas
+from .plans import FREE_PLAN, normalize_email, normalize_plan
+
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def get_password_hash(password):
+
+def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
-def verify_password(plain_password, hashed_password):
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
-# 2. 通过邮箱查找用户 (用于查重)
-def get_user_by_email(db: Session, email: str):
-    return db.query(models.User).filter(models.User.email == email).first()
 
-# 3. 创建新用户 (带加密)
+def get_user_by_email(db: Session, email: str):
+    normalized_email = normalize_email(email)
+    return db.query(models.User).filter(models.User.email == normalized_email).first()
+
+
 def create_user(db: Session, user: schemas.UserCreate):
-    # 真正的加密过程
+    normalized_email = normalize_email(user.email)
     hashed_password = get_password_hash(user.password)
-    # 创建数据库对象
-    db_user = models.User(email=user.email, hashed_password=hashed_password)
-    
+    db_user = models.User(
+        email=normalized_email,
+        hashed_password=hashed_password,
+        plan=FREE_PLAN,
+    )
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
     return db_user
+
+
+def update_user_plan(
+    db: Session,
+    user: models.User,
+    plan: str,
+    note: str | None = None,
+):
+    user.plan = normalize_plan(plan)
+    user.plan_granted_at = datetime.now(timezone.utc)
+    user.plan_note = note.strip() if note else None
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user

@@ -4,6 +4,7 @@ import { message } from 'antd';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { FormEvent, useState } from 'react';
+
 import { apiUrl } from '../lib/api';
 
 export default function RegisterPage() {
@@ -28,7 +29,7 @@ export default function RegisterPage() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          email,
+          email: email.trim().toLowerCase(),
           password,
         }),
       });
@@ -55,19 +56,19 @@ export default function RegisterPage() {
             Create Account
           </p>
           <p className="display-face mt-8 text-5xl font-extrabold leading-[0.95] tracking-[-0.04em]">
-            注册账号，
+            先注册邮箱，
             <br />
-            为后续留入口。
+            再绑定创始人永久基础版。
           </p>
           <p className="mt-6 max-w-md text-sm leading-7 text-[rgba(236,255,251,0.84)]">
-            当前版本主流程已经开放试用，注册更多是为了后续更多功能预留入口。
+            购买权益时请使用你准备长期使用的邮箱。后续创始人永久基础版会直接绑定到这个账号，未来基础更新继续可用。
           </p>
         </section>
 
         <section className="p-8 sm:p-12">
           <p className="display-face text-3xl font-bold">创建账号</p>
           <p className="mt-3 text-sm leading-7 text-[var(--muted)]">
-            用一个常用邮箱注册，之后可以直接回到工作台登录。
+            建议直接使用你的支付邮箱注册。等管理员为该邮箱开通后，登录就能获得创始人永久基础版权限。
           </p>
 
           <form className="mt-8 space-y-5" onSubmit={handleSubmit}>
@@ -116,7 +117,7 @@ export default function RegisterPage() {
 
           <div className="mt-6 flex items-center justify-between gap-3 text-sm text-[var(--muted)]">
             <Link className="font-semibold text-[var(--accent)]" href="/">
-              返回工作台
+              返回首页
             </Link>
             <Link className="font-semibold text-[var(--accent-cool)]" href="/login">
               已有账号？去登录

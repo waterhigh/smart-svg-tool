@@ -4,6 +4,7 @@ import { message } from 'antd';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { FormEvent, useState } from 'react';
+
 import { apiUrl } from '../lib/api';
 
 export default function LoginPage() {
@@ -18,7 +19,7 @@ export default function LoginPage() {
 
     try {
       const formData = new URLSearchParams();
-      formData.append('username', email);
+      formData.append('username', email.trim().toLowerCase());
       formData.append('password', password);
 
       const response = await fetch(apiUrl('/token'), {
@@ -49,22 +50,22 @@ export default function LoginPage() {
       <div className="glass-panel-strong grid w-full max-w-5xl overflow-hidden rounded-[36px] lg:grid-cols-[0.9fr_1.1fr]">
         <section className="bg-[linear-gradient(180deg,rgba(228,87,46,0.94),rgba(175,56,25,0.92))] p-8 text-[#fff6ed] sm:p-12">
           <p className="ink-pill border-[rgba(255,255,255,0.18)] bg-[rgba(255,255,255,0.1)] text-[#fff6ed]">
-            Account Access
+            Founder Access
           </p>
           <p className="display-face mt-8 text-5xl font-extrabold leading-[0.95] tracking-[-0.04em]">
             登录后，
             <br />
-            保留账号入口。
+            用邮箱领取创始人权益。
           </p>
           <p className="mt-6 max-w-md text-sm leading-7 text-[rgba(255,246,237,0.84)]">
-            主流程现在支持先试用再登录。账号暂时用于注册和后续扩展，上传与分割不再被登录墙拦住。
+            24.9 元创始人永久基础版通过邮箱绑定。请使用你购买时填写的邮箱登录，管理员会把该邮箱开通为永久基础版账号。
           </p>
         </section>
 
         <section className="p-8 sm:p-12">
           <p className="display-face text-3xl font-bold">登录 Smart SVG Tool</p>
           <p className="mt-3 text-sm leading-7 text-[var(--muted)]">
-            输入你注册时使用的邮箱和密码。
+            输入你注册时使用的邮箱和密码。若这个邮箱已经被开通创始人权益，登录后就能直接进入工作台。
           </p>
 
           <form className="mt-8 space-y-5" onSubmit={handleSubmit}>
@@ -99,7 +100,7 @@ export default function LoginPage() {
 
           <div className="mt-6 flex items-center justify-between gap-3 text-sm text-[var(--muted)]">
             <Link className="font-semibold text-[var(--accent)]" href="/">
-              返回工作台
+              返回首页
             </Link>
             <Link className="font-semibold text-[var(--accent-cool)]" href="/register">
               没有账号？去注册
