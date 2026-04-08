@@ -64,12 +64,6 @@ class Settings:
         self.task_ttl_hours = int(os.getenv("TASK_TTL_HOURS", "6"))
         self.max_upload_mb = int(os.getenv("MAX_UPLOAD_MB", "20"))
         self.max_image_side = int(os.getenv("MAX_IMAGE_SIDE", "4096"))
-        self.max_concurrent_jobs = max(
-            1, int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
-        )
-        self.max_concurrent_segments = max(
-            1, int(os.getenv("MAX_CONCURRENT_SEGMENTS", "1"))
-        )
 
         self.cors_origins = _split_csv(os.getenv("CORS_ORIGINS"), ["*"])
         self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
