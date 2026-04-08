@@ -302,8 +302,12 @@ export default function SvgEditor({
       formData.append('keep_holes', String(keepHoles));
       formData.append('largest_component', String(largestComponent));
 
+      const token = localStorage.getItem('smart_svg_token');
       const response = await fetch(apiUrl('/segment/'), {
         method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}` 
+        },
         body: formData,
       });
       const payload = await response.json();
