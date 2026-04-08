@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
+from threading import BoundedSemaphore
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
@@ -32,6 +34,8 @@ task_store = TaskStore(
     max_image_side=settings.max_image_side,
 )
 segmentation_service = SegmentationService(task_store)
+job_slots = BoundedSemaphore(settings.max_concurrent_jobs)
+segment_slots = BoundedSemaphore(settings.max_concurrent_segments)
 
 
 @asynccontextmanager
@@ -107,6 +111,19 @@ def _parse_box(raw_value: str | None) -> dict[str, float] | None:
     return {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
 
 
+@contextmanager
+def _reserve_slot(semaphore: BoundedSemaphore, detail: str):
+    if not semaphore.acquire(blocking=False):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail,
+        )
+    try:
+        yield
+    finally:
+        semaphore.release()
+
+
 @app.get("/health")
 async def health_check():
     return {
@@ -162,7 +179,11 @@ async def upload_image(
         raise HTTPException(status_code=400, detail="Please upload a valid image file.")
 
     try:
-        task = task_store.create_task(file)
+        with _reserve_slot(
+            job_slots,
+            "The server is busy. Please try your upload again in a moment.",
+        ):
+            task = await run_in_threadpool(task_store.create_task, file)
         logger.info(
             "Upload created",
             extra={
@@ -202,6 +223,8 @@ async def segment_image(
 ):
     points = _parse_points(points_json)
     box = _parse_box(box_json)
+    keep_holes_value = bool(_parse_bool(keep_holes, True))
+    largest_component_value = _parse_bool(largest_component, None)
     if not points and not box:
         raise HTTPException(
             status_code=400,
@@ -214,17 +237,29 @@ async def segment_image(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     try:
-        candidates = segmentation_service.segment(
-            task=task,
-            points=points,
-            box=box,
-            preset_name=preset,
-            vector_mode=vector_mode,
-            detail=detail,
-            smoothing=smoothing,
-            keep_holes=bool(_parse_bool(keep_holes, True)),
-            largest_component=_parse_bool(largest_component, None),
-        )
+        with _reserve_slot(
+            job_slots,
+            "The server is busy. Please try your request again in a moment.",
+        ):
+            with _reserve_slot(
+                segment_slots,
+                (
+                    "Too many segmentation requests are in progress. "
+                    "Please try again in a moment."
+                ),
+            ):
+                candidates = await run_in_threadpool(
+                    segmentation_service.segment,
+                    task,
+                    points,
+                    box,
+                    preset,
+                    vector_mode,
+                    detail,
+                    smoothing,
+                    keep_holes_value,
+                    largest_component_value,
+                )
         logger.info(
             "Segmentation completed",
             extra={
